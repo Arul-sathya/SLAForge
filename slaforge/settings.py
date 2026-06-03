@@ -11,7 +11,7 @@ class Settings(BaseSettings):
 
     anthropic_api_key: str = Field(..., description="Anthropic API key")
     claude_model: str = "claude-sonnet-4-6"
-    diagnosis_max_tokens: int = 1024
+    diagnosis_max_tokens: int = 2048
 
     github_token: str = Field(..., description="GitHub personal access token")
     github_owner: str = Field(..., description="GitHub org or username")

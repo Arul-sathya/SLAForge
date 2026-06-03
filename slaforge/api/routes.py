@@ -99,7 +99,6 @@ def get_health(db: Session = Depends(get_db_dep)) -> HealthResponse:
 # ── Integrations ───────────────────────────────────────────────────────────────
 @router.get("/integrations", response_model=list[IntegrationSchema], tags=["integrations"])
 def list_integrations(db: Session = Depends(get_db_dep)):
-    """List all integrations."""
     return db.query(Integration).order_by(Integration.created_at.asc()).all()
 
 
@@ -115,10 +114,7 @@ def get_integration(integration_id: str, db: Session = Depends(get_db_dep)):
 
 @router.post("/integrations/probe", response_model=ProbeResult, tags=["integrations"])
 async def probe_api(body: ProbeRequest) -> ProbeResult:
-    """
-    Claude probes an API URL — discovers endpoints, tests auth, suggests SLOs.
-    Call this before creating an integration to see what SLAForge found.
-    """
+    """Claude probes an API URL — discovers endpoints, tests auth, suggests SLOs."""
     result = await probe_integration(
         name=body.name,
         base_url=body.base_url,
@@ -133,15 +129,11 @@ async def create_integration(
     body: IntegrationCreateRequest,
     db: Session = Depends(get_db_dep),
 ) -> Integration:
-    """
-    Add a new integration. Claude probes it first, then spins up a poller.
-    """
-    # Check name uniqueness
+    """Add a new integration. Claude probes it first, then spins up a poller."""
     existing = db.query(Integration).filter(Integration.name == body.name).first()
     if existing:
         raise HTTPException(409, f"Integration '{body.name}' already exists")
 
-    # Probe the API
     probe = await probe_integration(
         name=body.name,
         base_url=body.base_url,
@@ -152,7 +144,6 @@ async def create_integration(
     if not probe.success:
         raise HTTPException(422, f"Probe failed: {probe.probe_summary}")
 
-    # Create integration record
     import uuid
     integration = Integration(
         id=uuid.uuid4(),
@@ -173,9 +164,7 @@ async def create_integration(
     integration_id = str(integration.id)
     logger.info("Created integration %s (%s)", body.name, integration_id)
 
-    # Start poller
     await start_poller(integration_id)
-
     return integration
 
 
@@ -205,7 +194,6 @@ def get_integration_metrics(
     limit: int = 100,
     db: Session = Depends(get_db_dep),
 ):
-    """Metric history for a specific integration."""
     return (
         db.query(MetricPoint)
         .filter(MetricPoint.integration_id == integration_id)
@@ -222,7 +210,6 @@ def get_integration_anomalies(
     limit: int = 50,
     db: Session = Depends(get_db_dep),
 ):
-    """Anomalies for a specific integration."""
     return (
         db.query(Anomaly)
         .filter(Anomaly.integration_id == integration_id)
@@ -234,7 +221,6 @@ def get_integration_anomalies(
 
 @router.get("/pollers", tags=["debug"])
 def get_pollers() -> dict:
-    """Status of all running poller tasks."""
     return get_active_pollers()
 
 
@@ -263,6 +249,20 @@ def get_anomaly(anomaly_id: int, db: Session = Depends(get_db_dep)):
     if not anomaly:
         raise HTTPException(404, f"Anomaly {anomaly_id} not found")
     return anomaly
+
+
+@router.get("/anomalies/{anomaly_id}/remediation", tags=["anomalies"])
+def get_remediation(anomaly_id: int, db: Session = Depends(get_db_dep)):
+    """Get the auto-generated remediation script for an anomaly (confidence > 85% only)."""
+    anomaly = db.query(Anomaly).filter(Anomaly.id == anomaly_id).first()
+    if not anomaly:
+        raise HTTPException(404, f"Anomaly {anomaly_id} not found")
+    if not anomaly.remediation_script:
+        raise HTTPException(
+            404,
+            "No remediation script available — confidence threshold not met (need >85%)"
+        )
+    return PlainTextResponse(anomaly.remediation_script)
 
 
 @router.post("/anomalies/{anomaly_id}/resolve",
