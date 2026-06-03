@@ -1,0 +1,87 @@
+version: '3.9'
+
+services:
+
+  # ── SLAForge core service ──────────────────────────────────────────────────
+  slaforge:
+    build: .
+    container_name: slaforge
+    ports:
+      - "8000:8000"
+    environment:
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      - GITHUB_TOKEN=${GITHUB_TOKEN}
+      - GITHUB_OWNER=${GITHUB_OWNER}
+      - GITHUB_REPO=${GITHUB_REPO}
+      - GITHUB_WEBHOOK_SECRET=${GITHUB_WEBHOOK_SECRET:-changeme}
+      - DATABASE_URL=postgresql://slaforge:slaforge@postgres:5432/slaforge
+      - SYNC_INTERVAL_SECONDS=${SYNC_INTERVAL_SECONDS:-60}
+      - CUSUM_THRESHOLD=${CUSUM_THRESHOLD:-5.0}
+      - CLAUDE_MODEL=${CLAUDE_MODEL:-claude-sonnet-4-6}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - slaforge-net
+
+  # ── PostgreSQL (anomaly + runbook persistence) ─────────────────────────────
+  postgres:
+    image: postgres:15-alpine
+    container_name: slaforge-postgres
+    environment:
+      POSTGRES_USER:     slaforge
+      POSTGRES_PASSWORD: slaforge
+      POSTGRES_DB:       slaforge
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./sql/init.sql:/docker-entrypoint-initdb.d/init.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U slaforge -d slaforge"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks:
+      - slaforge-net
+
+  # ── Prometheus (metrics collection) ───────────────────────────────────────
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: slaforge-prometheus
+    ports:
+      - "9091:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--storage.tsdb.retention.time=7d"
+    networks:
+      - slaforge-net
+
+  # ── Grafana (dashboards) ───────────────────────────────────────────────────
+  grafana:
+    image: grafana/grafana:latest
+    container_name: slaforge-grafana
+    ports:
+      - "3001:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=slaforge
+      - GF_USERS_ALLOW_SIGN_UP=false
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+    depends_on:
+      - prometheus
+    networks:
+      - slaforge-net
+
+volumes:
+  postgres_data:
+  prometheus_data:
+  grafana_data:
+
+networks:
+  slaforge-net:
+    driver: bridge
