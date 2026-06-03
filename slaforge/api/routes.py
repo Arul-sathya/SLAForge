@@ -16,12 +16,17 @@ from sqlalchemy.orm import Session
 from slaforge.database import get_db_dep
 from slaforge.detection.cusum import get_detectors
 from slaforge.ingestion.github_client import get_metrics, set_simulation
+from slaforge.integration_manager import (
+    start_poller, stop_poller, get_active_pollers,
+)
 from slaforge.models import (
     Anomaly, AnomalySchema, AnomalyType, HealthResponse,
-    MetricPoint, MetricPointSchema, ResolutionStatus,
+    Integration, IntegrationCreateRequest, IntegrationSchema,
+    IntegrationStatus, MetricPoint, MetricPointSchema,
+    ProbeRequest, ProbeResult, ResolutionStatus,
     ResolveRequest, Severity, SimulateRequest,
 )
-from prometheus_client import generate_latest, CONTENT_TYPE_LATEST
+from slaforge.probe import probe_integration
 from slaforge.storage.prometheus_metrics import (
     registry, open_anomalies, health_score, cusum_score,
 )
@@ -30,18 +35,12 @@ router = APIRouter()
 logger = logging.getLogger(__name__)
 _start_time = time.time()
 
-# Track active simulation tasks
 _simulation_task: Optional[asyncio.Task] = None
 
 
-# ── Health ────────────────────────────────────────────────────────────────────
+# ── Health ─────────────────────────────────────────────────────────────────────
 @router.get("/health", response_model=HealthResponse, tags=["monitoring"])
 def get_health(db: Session = Depends(get_db_dep)) -> HealthResponse:
-    """
-    Current integration health.
-    health_score: 1.0 = healthy, 0.0 = dead.
-    Degraded by: error rate, open anomalies, rate limit exhaustion.
-    """
     open_count = (
         db.query(Anomaly)
         .filter(Anomaly.status.in_([
@@ -56,7 +55,10 @@ def get_health(db: Session = Depends(get_db_dep)) -> HealthResponse:
         .first()
     )
 
-    # Compute health score
+    integrations_count = db.query(Integration).filter(
+        Integration.status != IntegrationStatus.INACTIVE
+    ).count()
+
     score = 1.0
     if open_count >= 3:
         score -= 0.5
@@ -76,15 +78,8 @@ def get_health(db: Session = Depends(get_db_dep)) -> HealthResponse:
                 score -= 0.3
 
     score = max(0.0, min(1.0, round(score, 3)))
+    status = "healthy" if score >= 0.8 else "degraded" if score >= 0.5 else "critical"
 
-    if score >= 0.8:
-        status = "healthy"
-    elif score >= 0.5:
-        status = "degraded"
-    else:
-        status = "critical"
-
-    # Update Prometheus gauges
     health_score.set(score)
     open_anomalies.set(open_count)
     for name, det in get_detectors().items():
@@ -97,23 +92,168 @@ def get_health(db: Session = Depends(get_db_dep)) -> HealthResponse:
         last_metric=MetricPointSchema.from_orm(last_metric) if last_metric else None,
         rate_limit_pct_used=rl_pct_used,
         uptime_seconds=round(time.time() - _start_time, 1),
+        integrations_count=integrations_count,
     )
 
 
-# ── Anomalies ─────────────────────────────────────────────────────────────────
+# ── Integrations ───────────────────────────────────────────────────────────────
+@router.get("/integrations", response_model=list[IntegrationSchema], tags=["integrations"])
+def list_integrations(db: Session = Depends(get_db_dep)):
+    """List all integrations."""
+    return db.query(Integration).order_by(Integration.created_at.asc()).all()
+
+
+@router.get("/integrations/{integration_id}", response_model=IntegrationSchema, tags=["integrations"])
+def get_integration(integration_id: str, db: Session = Depends(get_db_dep)):
+    integration = db.query(Integration).filter(
+        Integration.id == integration_id
+    ).first()
+    if not integration:
+        raise HTTPException(404, f"Integration {integration_id} not found")
+    return integration
+
+
+@router.post("/integrations/probe", response_model=ProbeResult, tags=["integrations"])
+async def probe_api(body: ProbeRequest) -> ProbeResult:
+    """
+    Claude probes an API URL — discovers endpoints, tests auth, suggests SLOs.
+    Call this before creating an integration to see what SLAForge found.
+    """
+    result = await probe_integration(
+        name=body.name,
+        base_url=body.base_url,
+        auth_type=body.auth_type,
+        auth_token=body.auth_token,
+    )
+    return result
+
+
+@router.post("/integrations", response_model=IntegrationSchema, tags=["integrations"])
+async def create_integration(
+    body: IntegrationCreateRequest,
+    db: Session = Depends(get_db_dep),
+) -> Integration:
+    """
+    Add a new integration. Claude probes it first, then spins up a poller.
+    """
+    # Check name uniqueness
+    existing = db.query(Integration).filter(Integration.name == body.name).first()
+    if existing:
+        raise HTTPException(409, f"Integration '{body.name}' already exists")
+
+    # Probe the API
+    probe = await probe_integration(
+        name=body.name,
+        base_url=body.base_url,
+        auth_type=body.auth_type,
+        auth_token=body.auth_token,
+    )
+
+    if not probe.success:
+        raise HTTPException(422, f"Probe failed: {probe.probe_summary}")
+
+    # Create integration record
+    import uuid
+    integration = Integration(
+        id=uuid.uuid4(),
+        name=body.name,
+        base_url=body.base_url,
+        auth_type=body.auth_type,
+        auth_token=body.auth_token,
+        endpoints=probe.endpoints,
+        slo_thresholds=probe.slo_suggestions,
+        status=IntegrationStatus.ACTIVE,
+        health_score=1.0,
+        is_default=False,
+        probe_summary=probe.probe_summary,
+    )
+    db.add(integration)
+    db.flush()
+
+    integration_id = str(integration.id)
+    logger.info("Created integration %s (%s)", body.name, integration_id)
+
+    # Start poller
+    await start_poller(integration_id)
+
+    return integration
+
+
+@router.delete("/integrations/{integration_id}", tags=["integrations"])
+async def delete_integration(
+    integration_id: str,
+    db: Session = Depends(get_db_dep),
+) -> dict:
+    """Remove an integration and stop its poller."""
+    integration = db.query(Integration).filter(
+        Integration.id == integration_id
+    ).first()
+    if not integration:
+        raise HTTPException(404, f"Integration {integration_id} not found")
+    if integration.is_default:
+        raise HTTPException(400, "Cannot delete the default GitHub integration")
+
+    await stop_poller(integration_id)
+    db.delete(integration)
+    return {"status": "deleted", "id": integration_id}
+
+
+@router.get("/integrations/{integration_id}/metrics",
+            response_model=list[MetricPointSchema], tags=["integrations"])
+def get_integration_metrics(
+    integration_id: str,
+    limit: int = 100,
+    db: Session = Depends(get_db_dep),
+):
+    """Metric history for a specific integration."""
+    return (
+        db.query(MetricPoint)
+        .filter(MetricPoint.integration_id == integration_id)
+        .order_by(MetricPoint.recorded_at.desc())
+        .limit(limit)
+        .all()
+    )
+
+
+@router.get("/integrations/{integration_id}/anomalies",
+            response_model=list[AnomalySchema], tags=["integrations"])
+def get_integration_anomalies(
+    integration_id: str,
+    limit: int = 50,
+    db: Session = Depends(get_db_dep),
+):
+    """Anomalies for a specific integration."""
+    return (
+        db.query(Anomaly)
+        .filter(Anomaly.integration_id == integration_id)
+        .order_by(Anomaly.detected_at.desc())
+        .limit(limit)
+        .all()
+    )
+
+
+@router.get("/pollers", tags=["debug"])
+def get_pollers() -> dict:
+    """Status of all running poller tasks."""
+    return get_active_pollers()
+
+
+# ── Anomalies ──────────────────────────────────────────────────────────────────
 @router.get("/anomalies", response_model=list[AnomalySchema], tags=["anomalies"])
 def list_anomalies(
     status: Optional[str] = None,
+    integration_id: Optional[str] = None,
     limit: int = 50,
     db: Session = Depends(get_db_dep),
 ) -> list:
-    """List detected anomalies, optionally filtered by status."""
     q = db.query(Anomaly).order_by(Anomaly.detected_at.desc())
     if status:
         try:
             q = q.filter(Anomaly.status == ResolutionStatus(status))
         except ValueError:
             raise HTTPException(400, f"Invalid status: {status}")
+    if integration_id:
+        q = q.filter(Anomaly.integration_id == integration_id)
     return q.limit(limit).all()
 
 
@@ -132,7 +272,6 @@ def resolve_anomaly(
     body: ResolveRequest,
     db: Session = Depends(get_db_dep),
 ):
-    """Mark an anomaly as resolved with a resolution note."""
     anomaly = db.query(Anomaly).filter(Anomaly.id == anomaly_id).first()
     if not anomaly:
         raise HTTPException(404, f"Anomaly {anomaly_id} not found")
@@ -143,11 +282,9 @@ def resolve_anomaly(
     return anomaly
 
 
-# ── Metrics ───────────────────────────────────────────────────────────────────
-@router.get("/metrics/history", response_model=list[MetricPointSchema],
-            tags=["metrics"])
+# ── Metrics ────────────────────────────────────────────────────────────────────
+@router.get("/metrics/history", response_model=list[MetricPointSchema], tags=["metrics"])
 def get_metric_history(limit: int = 100, db: Session = Depends(get_db_dep)):
-    """Last N metric data points for charting."""
     return (
         db.query(MetricPoint)
         .order_by(MetricPoint.recorded_at.desc())
@@ -158,17 +295,12 @@ def get_metric_history(limit: int = 100, db: Session = Depends(get_db_dep)):
 
 @router.get("/metrics", tags=["metrics"])
 def prometheus_metrics() -> Response:
-    """Prometheus metrics endpoint. Scraped by Grafana."""
-    return Response(
-        generate_latest(registry),
-        media_type=CONTENT_TYPE_LATEST,
-    )
+    return Response(generate_latest(registry), media_type=CONTENT_TYPE_LATEST)
 
 
-# ── Runbook ───────────────────────────────────────────────────────────────────
+# ── Runbook ────────────────────────────────────────────────────────────────────
 @router.get("/runbook", response_class=PlainTextResponse, tags=["runbook"])
 def get_runbook() -> str:
-    """Return the auto-generated runbook as markdown."""
     from slaforge.settings import settings
     import os
     if not os.path.exists(settings.runbook_path):
@@ -177,14 +309,9 @@ def get_runbook() -> str:
         return f.read()
 
 
-# ── Simulation ────────────────────────────────────────────────────────────────
+# ── Simulation ─────────────────────────────────────────────────────────────────
 @router.post("/simulate", tags=["debug"])
 async def simulate_anomaly(body: SimulateRequest) -> dict:
-    """
-    Inject a simulated anomaly for demo/testing purposes.
-    Sets simulation flags on the GitHub client for duration_seconds,
-    then clears them. CUSUM will detect the anomaly and Claude will diagnose it.
-    """
     global _simulation_task
     if _simulation_task and not _simulation_task.done():
         raise HTTPException(409, "A simulation is already running")
@@ -214,15 +341,13 @@ async def simulate_anomaly(body: SimulateRequest) -> dict:
 
 @router.get("/simulate/status", tags=["debug"])
 def simulation_status() -> dict:
-    """Check if a simulation is currently running."""
     running = _simulation_task is not None and not _simulation_task.done()
     return {"simulation_running": running}
 
 
-# ── CUSUM debug ───────────────────────────────────────────────────────────────
+# ── Debug ──────────────────────────────────────────────────────────────────────
 @router.get("/debug/cusum", tags=["debug"])
 def debug_cusum() -> dict:
-    """Current CUSUM state for all detectors."""
     detectors = get_detectors()
     return {
         name: {
@@ -232,7 +357,6 @@ def debug_cusum() -> dict:
             "baseline_mean": round(d.baseline_mean, 4),
             "baseline_std":  round(d.baseline_std, 4),
             "history_len":   len(d.history),
-            "threshold":     d.__class__.__dataclass_fields__  # just show name
         }
         for name, d in detectors.items()
     }
