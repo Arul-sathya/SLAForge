@@ -111,7 +111,6 @@ _DIAGNOSIS_PROMPT = dedent("""
     Do not include any text outside the JSON object.
 """).strip()
 
-# Phase 2: Auto-remediation prompt
 _REMEDIATION_PROMPT = dedent("""
     You are an expert Forward Deployment Engineer. A production integration failure has been diagnosed
     with high confidence ({confidence:.0%}). Generate a runnable remediation script.
@@ -196,7 +195,6 @@ async def _generate_remediation(
     confidence: float,
     fix_steps: list,
 ) -> Optional[str]:
-    """Phase 2: Generate a runnable remediation script when confidence > 0.85."""
     try:
         steps_text = "\n".join(f"{i+1}. {s}" for i, s in enumerate(fix_steps))
         prompt = _REMEDIATION_PROMPT.format(
@@ -208,7 +206,6 @@ async def _generate_remediation(
             affected_component=affected_component,
             fix_steps=steps_text,
         )
-
         message = _client.messages.create(
             model=settings.claude_model,
             max_tokens=1500,
@@ -217,7 +214,6 @@ async def _generate_remediation(
         script = message.content[0].text.strip()
         logger.info("Remediation script generated (%d chars)", len(script))
         return script
-
     except Exception:
         logger.exception("Remediation generation failed")
         return None
@@ -238,8 +234,8 @@ async def diagnose_anomaly(anomaly_id: int) -> None:
         anomaly_context = _ANOMALY_CONTEXT.get(anomaly.anomaly_type, "Unknown anomaly type.")
         metric_timeline = _format_metric_timeline(anomaly.metric_snapshot)
         log_context     = _fetch_log_context(30)
+        a_type_for_remediation = anomaly.anomaly_type
 
-        # Get integration info for context
         integration_name = "unknown"
         integration_url  = "unknown"
         if anomaly.integration_id:
@@ -279,46 +275,64 @@ async def diagnose_anomaly(anomaly_id: int) -> None:
             raise json.JSONDecodeError("No JSON found", raw_response, 0)
         diagnosis = json.loads(match.group())
 
-        confidence  = float(diagnosis.get("confidence", 0.0))
-        root_cause  = diagnosis.get("root_cause", "Unknown")
-        fix_steps   = diagnosis.get("fix_steps", [])
-        affected    = diagnosis.get("affected_component", "unknown")
+        confidence = float(diagnosis.get("confidence", 0.0))
+        root_cause = diagnosis.get("root_cause", "Unknown")
+        fix_steps  = diagnosis.get("fix_steps", [])
+        affected   = diagnosis.get("affected_component", "unknown")
 
-        # Phase 2: Generate remediation script if confidence > 0.85
+        # Phase 2: Auto-remediation
         remediation_script = None
         if confidence >= 0.80:
             logger.info(
-                "Confidence %.2f >= 0.85 — generating remediation script for anomaly %d",
+                "Confidence %.2f >= 0.80 — generating remediation script for anomaly %d",
                 confidence, anomaly_id,
             )
             remediation_script = await _generate_remediation(
                 integration_name=integration_name,
                 integration_url=integration_url,
-                anomaly_type=anomaly_type_val if 'anomaly_type_val' in dir() else AnomalyType.ERROR_RATE_SPIKE,
+                anomaly_type=a_type_for_remediation,
                 root_cause=root_cause,
                 affected_component=affected,
                 confidence=confidence,
                 fix_steps=fix_steps,
             )
 
-        # Save back to DB
+        # Save to DB
         with get_db() as db:
             anomaly = db.query(Anomaly).filter(Anomaly.id == anomaly_id).first()
             if not anomaly:
                 return
 
-            anomaly.root_cause          = root_cause
-            anomaly.confidence          = confidence
-            anomaly.affected_component  = affected
-            anomaly.fix_steps           = json.dumps(fix_steps)
-            anomaly.runbook_entry       = diagnosis.get("runbook_entry", "")
-            anomaly.log_context         = log_context[:4000]
-            anomaly.status              = ResolutionStatus.OPEN
-            anomaly.remediation_script  = remediation_script
+            anomaly.root_cause         = root_cause
+            anomaly.confidence         = confidence
+            anomaly.affected_component = affected
+            anomaly.fix_steps          = json.dumps(fix_steps)
+            anomaly.runbook_entry      = diagnosis.get("runbook_entry", "")
+            anomaly.log_context        = log_context[:4000]
+            anomaly.status             = ResolutionStatus.OPEN
+            anomaly.remediation_script = remediation_script
 
             a_type  = anomaly.anomaly_type
             a_sev   = anomaly.severity
             a_score = anomaly.cusum_score
+
+        # Phase 4: Slack alert
+        try:
+            from slaforge.alerting.slack import send_anomaly_alert
+            await send_anomaly_alert(
+                anomaly_id=anomaly_id,
+                integration_name=integration_name,
+                integration_url=integration_url,
+                anomaly_type=a_type.value,
+                severity=a_sev.value,
+                cusum_score=a_score,
+                root_cause=root_cause,
+                confidence=confidence,
+                affected_component=affected,
+                has_remediation=remediation_script is not None,
+            )
+        except Exception:
+            logger.exception("Slack alert failed for anomaly %d", anomaly_id)
 
         logger.info(
             "Diagnosis complete for anomaly %d: %s (confidence=%.2f)%s",
