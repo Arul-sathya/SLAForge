@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import json
 import logging
-from typing import Optional
+from typing import List, Optional
 
 import httpx
 
@@ -138,4 +138,74 @@ async def send_anomaly_alert(
                 return False
     except Exception:
         logger.exception("Slack alert error for anomaly %d", anomaly_id)
+        return False
+async def send_incident_alert(
+    incident_id: int,
+    integration_names: list,
+    blast_radius_summary: Optional[str],
+    anomaly_count: int,
+) -> bool:
+    """Send a Slack alert for a correlated multi-integration incident."""
+    if not settings.slack_webhook_url:
+        return False
+
+    names_str = ", ".join(f"`{n}`" for n in integration_names)
+
+    blocks = [
+        {
+            "type": "header",
+            "text": {
+                "type": "plain_text",
+                "text": f"🚨 Correlated Incident #{incident_id} — Blast Radius Detected",
+            }
+        },
+        {
+            "type": "section",
+            "fields": [
+                {"type": "mrkdwn", "text": f"*Affected Integrations:*\n{names_str}"},
+                {"type": "mrkdwn", "text": f"*Simultaneous Anomalies:*\n`{anomaly_count}`"},
+            ]
+        },
+        {
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": f"*Blast Radius Analysis:*\n{blast_radius_summary or 'Analyzing...'}",
+            }
+        },
+        {
+            "type": "context",
+            "elements": [
+                {
+                    "type": "mrkdwn",
+                    "text": f"SLAForge incident correlation | `GET /incidents/{incident_id}`"
+                }
+            ]
+        }
+    ]
+
+    payload = {
+        "attachments": [
+            {
+                "color": "#FF0000",
+                "blocks": blocks,
+            }
+        ]
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.post(
+                settings.slack_webhook_url,
+                content=json.dumps(payload),
+                headers={"Content-Type": "application/json"},
+            )
+            if resp.status_code == 200:
+                logger.info("Slack incident alert sent for incident %d", incident_id)
+                return True
+            else:
+                logger.error("Slack incident alert failed: %d %s", resp.status_code, resp.text)
+                return False
+    except Exception:
+        logger.exception("Slack incident alert error for incident %d", incident_id)
         return False

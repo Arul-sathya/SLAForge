@@ -21,7 +21,7 @@ from slaforge.integration_manager import (
 )
 from slaforge.models import (
     Anomaly, AnomalySchema, AnomalyType, HealthResponse,
-    Integration, IntegrationCreateRequest, IntegrationSchema,
+    Incident, Integration, IntegrationCreateRequest, IntegrationSchema,
     IntegrationStatus, MetricPoint, MetricPointSchema,
     ProbeRequest, ProbeResult, ResolutionStatus,
     ResolveRequest, Severity, SimulateRequest,
@@ -253,14 +253,14 @@ def get_anomaly(anomaly_id: int, db: Session = Depends(get_db_dep)):
 
 @router.get("/anomalies/{anomaly_id}/remediation", tags=["anomalies"])
 def get_remediation(anomaly_id: int, db: Session = Depends(get_db_dep)):
-    """Get the auto-generated remediation script for an anomaly (confidence > 85% only)."""
+    """Get the auto-generated remediation script for an anomaly."""
     anomaly = db.query(Anomaly).filter(Anomaly.id == anomaly_id).first()
     if not anomaly:
         raise HTTPException(404, f"Anomaly {anomaly_id} not found")
     if not anomaly.remediation_script:
         raise HTTPException(
             404,
-            "No remediation script available — confidence threshold not met (need >85%)"
+            "No remediation script available — confidence threshold not met (need >80%)"
         )
     return PlainTextResponse(anomaly.remediation_script)
 
@@ -280,6 +280,51 @@ def resolve_anomaly(
     anomaly.resolution_note = body.resolution_note
     db.flush()
     return anomaly
+
+
+# ── Incidents ──────────────────────────────────────────────────────────────────
+@router.get("/incidents", tags=["incidents"])
+def list_incidents(db: Session = Depends(get_db_dep)):
+    """List correlated multi-integration incidents with blast radius analysis."""
+    from slaforge.models import IncidentStatus
+    incidents = db.query(Incident).order_by(Incident.detected_at.desc()).limit(20).all()
+    return [
+        {
+            "id":                    i.id,
+            "detected_at":           i.detected_at.isoformat(),
+            "integration_ids":       i.integration_ids,
+            "blast_radius_summary":  i.blast_radius_summary,
+            "anomaly_count":         len(i.anomalies) if i.anomalies else 0,
+            "status":                i.status.value,
+            "correlation_window_s":  i.correlation_window_seconds,
+        }
+        for i in incidents
+    ]
+
+
+@router.get("/incidents/{incident_id}", tags=["incidents"])
+def get_incident(incident_id: int, db: Session = Depends(get_db_dep)):
+    """Get a specific incident with all correlated anomalies."""
+    incident = db.query(Incident).filter(Incident.id == incident_id).first()
+    if not incident:
+        raise HTTPException(404, f"Incident {incident_id} not found")
+    return {
+        "id":                   incident.id,
+        "detected_at":          incident.detected_at.isoformat(),
+        "integration_ids":      incident.integration_ids,
+        "blast_radius_summary": incident.blast_radius_summary,
+        "status":               incident.status.value,
+        "anomalies":            [
+            {
+                "id":           a.id,
+                "anomaly_type": a.anomaly_type.value,
+                "severity":     a.severity.value,
+                "root_cause":   a.root_cause,
+                "confidence":   a.confidence,
+            }
+            for a in incident.anomalies
+        ] if incident.anomalies else [],
+    }
 
 
 # ── Metrics ────────────────────────────────────────────────────────────────────
